@@ -1,0 +1,60 @@
+{
+  "port": 8590,
+  "image_tokens": 1600,
+  "compact": {
+    "keep_recent": 6,
+    "auto_threshold": 0.8,
+    "max_tokens": 2000
+  },
+  "models": [
+    {
+      "id": "model-a",
+      "name": "Model A (vision, 128k)",
+      "base_url": "http://127.0.0.1:8504/v1",
+      "model": "model-a",
+      "context_window": 131072,
+      "max_tokens": 131072,
+      "input": ["text", "image"],
+      "tools": true
+    },
+    {
+      "id": "model-b",
+      "name": "Model B (vision, 110k)",
+      "base_url": "http://127.0.0.1:8505/v1",
+      "model": "model-b",
+      "context_window": 110000,
+      "max_tokens": 100000,
+      "input": ["text", "image"],
+      "tools": true
+    },
+    {
+      "id": "model-c",
+      "name": "Model C (text, 100k)",
+      "base_url": "http://127.0.0.1:8506/v1",
+      "model": "model-c",
+      "context_window": 100000,
+      "max_tokens": 100000,
+      "input": ["text"],
+      "tools": false
+    }
+  ],
+  "mcp": [
+    {
+      "name": "websearch",
+      "transport": "http",
+      "url": "http://127.0.0.1:8560/mcp",
+      "enabled": true
+    },
+    {
+      "name": "example-stdio",
+      "transport": "stdio",
+      "command": "bun run mcp/example-mcp.ts",
+      "cwd": "./mcp",
+      "env": {
+        "PATH": "/usr/local/bin:/usr/bin:/bin"
+      },
+      "timeout": 120,
+      "enabled": false
+    }
+  ]
+}
