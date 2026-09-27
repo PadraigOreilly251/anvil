@@ -22,6 +22,8 @@ from flask import Flask, jsonify, render_template, request
 
 from mcp_client import McpManager, McpError
 
+import vcc_compact as V
+
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 MEDIA_DIR = os.path.join(APP_DIR, "media")
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
@@ -58,6 +60,12 @@ class Session:
         self.history = []
         self.compactions = 0
         self.lock = threading.Lock()
+        # vcc: full transcript log (survives compactions) + recall
+        self.log = []
+        self.log_n = 0
+        self.log_offset = 0
+        self.vcc_sections = None
+        self.mode = "summary"
 
 
 SESSIONS = {"main": Session()}
@@ -119,41 +127,91 @@ def sse(event, data):
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
-def do_compact(sess, model, image_tokens, emit):
-    """Summarize older messages, keep the most recent N. Returns True if compacted."""
+def log_entry(sess, role, text, reasoning="", tool_calls=None):
+    e = {
+        "idx": sess.log_n,
+        "role": role,
+        "text": (text or "")[:4000],
+        "reasoning": (reasoning or "")[:2000],
+        "tool_calls": [
+            {"name": (t.get("function", t) or {}).get("name", "?"),
+             "args": ((t.get("function", t) or {}).get(
+                 "arguments") or t.get("args", ""))[:500]}
+            for t in (tool_calls or [])
+        ],
+    }
+    sess.log.append(e)
+    sess.log_n += 1
+    return e
+
+
+def format_recall(r):
+    out = []
+    if r.get("touched"):
+        out.append("paths (entry #s):")
+        for t in r["touched"][:40]:
+            out.append(f"  {t['path']}  #{'/ #'.join(map(str, t['entries']))}")
+    for e in r.get("expanded") or []:
+        out.append(f"--- #{e['idx']} [{e['role']}] ---")
+        out.append((e.get("text") or "")[:3000])
+        if e.get("reasoning"):
+            out.append("  reasoning: " + e["reasoning"][:1000])
+        for tc in e.get("tool_calls") or []:
+            out.append(f"  * {tc['name']} {tc['args'][:200]}")
+    if r.get("hits"):
+        out.append(f"hits ({r['total']} total):")
+        for h in r["hits"]:
+            out.append(f"  #{h['idx']} [{h['role']}] (score {h['score']}) {h['snippet']}")
+    if not out:
+        out.append("no matches")
+    return "\n".join(out)
+
+
+def do_compact(sess, model, image_tokens, emit, mode="summary"):
+    """Compact older history. mode: 'summary' (LLM) or 'vcc' (algorithmic). Returns True if compacted."""
     keep = CONFIG.get("compact", {}).get("keep_recent", 6)
     if len(sess.history) <= keep + 2:
         return False
-    old = sess.history[:-keep]
-    prompt_msgs = [
-        {
-            "role": "system",
-            "content": (
-                "You compact chat history into a faithful, dense summary. Preserve: "
-                "user goals, decisions, facts, numbers, file paths, error messages, "
-                "current task state, open questions. Plain text, no preamble."
-            ),
-        },
-        {"role": "user", "content": flatten_transcript(old)[:180000]},
-    ]
-    ct = CONFIG.get("compact", {}).get("max_tokens", 2000)
-    with httpx.Client(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
-        r = client.post(
-            model["base_url"].rstrip("/") + "/chat/completions",
-            json={
-                "model": model["model"],
-                "messages": prompt_msgs,
-                "max_tokens": ct,
-                "temperature": 0,
+    if mode == "vcc":
+        old = sess.log[sess.log_offset: max(sess.log_offset, len(sess.log) - keep)]
+        if len(old) < 2:
+            return False
+        summary, sess.vcc_sections = V.compact_vcc(old, sess.vcc_sections, keep=0)
+        if not summary:
+            return False
+        sess.log_offset = max(sess.log_offset, len(sess.log) - keep)
+    else:
+        old = sess.history[:-keep]
+        prompt_msgs = [
+            {
+                "role": "system",
+                "content": (
+                    "You compact chat history into a faithful, dense summary. Preserve: "
+                    "user goals, decisions, facts, numbers, file paths, error messages, "
+                    "current task state, open questions. Plain text, no preamble."
+                ),
             },
-        )
-        r.raise_for_status()
-        summary = (r.json()["choices"][0]["message"].get("content") or "").strip()
+            {"role": "user", "content": flatten_transcript(old)[:180000]},
+        ]
+        ct = CONFIG.get("compact", {}).get("max_tokens", 2000)
+        with httpx.Client(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
+            r = client.post(
+                model["base_url"].rstrip("/") + "/chat/completions",
+                json={
+                    "model": model["model"],
+                    "messages": prompt_msgs,
+                    "max_tokens": ct,
+                    "temperature": 0,
+                },
+            )
+            r.raise_for_status()
+            summary = (r.json()["choices"][0]["message"].get("content") or "").strip()
     sess.history = [
         {
             "role": "system",
             "content": (
-                "[HISTORY COMPACTED — summary of earlier conversation]\n" + summary
+                "[HISTORY COMPACTED — earlier conversation, see summary below]\n"
+                + summary
             ),
         }
     ] + sess.history[-keep:]
@@ -235,6 +293,10 @@ def api_reset():
     with s.lock:
         s.history = []
         s.compactions = 0
+        s.log = []
+        s.log_n = 0
+        s.log_offset = 0
+        s.vcc_sections = None
     return jsonify(ok=True)
 
 
@@ -250,11 +312,30 @@ def api_compact():
     s = get_session(sid)
     image_tokens = CONFIG.get("image_tokens", 1600)
     with s.lock:
-        ok = do_compact(s, model, image_tokens, emit=lambda d: None)
+        m = data.get("mode")
+        if m in ("summary", "vcc"):
+            s.mode = m
+        ok = do_compact(s, model, image_tokens, emit=lambda d: None, mode=s.mode)
         return jsonify(
             ok=ok,
             compactions=s.compactions,
             est=estimate_tokens(s.history, image_tokens),
+        )
+
+
+@app.post("/api/recall")
+def api_recall():
+    data = request.get_json() or {}
+    sid = data.get("session", "main")
+    s = get_session(sid)
+    with s.lock:
+        return jsonify(
+            V.recall_search(
+                s.log,
+                data.get("query", ""),
+                mode=data.get("mode"),
+                page=int(data.get("page", 1)),
+            )
         )
 
 
@@ -280,6 +361,9 @@ def api_chat():
     max_out = min(model.get("max_tokens", 8192), max(1024, max_ctx // 2))
     keep = CONFIG.get("compact", {}).get("keep_recent", 6)
     threshold = CONFIG.get("compact", {}).get("auto_threshold", 0.8)
+    cm = (data.get("compact_mode") or "").strip().lower()
+    if cm in ("summary", "vcc"):
+        sess.mode = cm
 
     def generate():
         # ---- build user message
@@ -314,9 +398,40 @@ def api_chat():
             sess.history.append(
                 {"role": "user", "content": parts}
             )
+            log_entry(
+                sess,
+                "user",
+                text + (f" [+{len(media_ids)} media attached]" if media_ids else ""),
+            )
             tools, tool_index = ([], {})
             if use_tools:
                 tools, tool_index = MCP.all_tools()
+                tools.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "vcc_recall",
+                            "description": (
+                                "Search this session's full transcript, including "
+                                "anything dropped by compaction. Use when earlier "
+                                "details are missing. mode='touched' lists "
+                                "files/paths with entry indices; query '#N' "
+                                "returns entry N in full."
+                            ),
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "query": {"type": "string"},
+                                    "mode": {"type": "string",
+                                            "enum": ["touched"]},
+                                    "page": {"type": "integer",
+                                            "minimum": 1},
+                                },
+                                "required": ["query"],
+                            },
+                        },
+                    }
+                )
             compacted_this_turn = False
             thinking_total = 0
             max_attempts = 3
@@ -332,7 +447,7 @@ def api_chat():
                 ):
                     yield sse("status", {"status": "compacting"})
                     try:
-                        do_compact(sess, model, image_tokens, emit=lambda d: None)
+                        do_compact(sess, model, image_tokens, emit=lambda d: None, mode=sess.mode)
                         compacted_this_turn = True
                         yield sse("compacted", {"n": sess.compactions, "est": estimate_tokens(sess.history, image_tokens)})
                     except Exception as e:
@@ -377,7 +492,7 @@ def api_chat():
                                     and len(sess.history) > keep + 2
                                 ):
                                     yield sse("status", {"status": "compacting (context limit)"})
-                                    do_compact(sess, model, image_tokens, emit=lambda d: None)
+                                    do_compact(sess, model, image_tokens, emit=lambda d: None, mode=sess.mode)
                                     compacted_this_turn = True
                                     yield sse("compacted", {"n": sess.compactions, "est": estimate_tokens(sess.history, image_tokens)})
                                     continue
@@ -451,6 +566,10 @@ def api_chat():
                 if tool_calls:
                     asst["tool_calls"] = tool_calls
                 sess.history.append(asst)
+                log_entry(
+                    sess, "assistant", content_buf,
+                    reasoning=reasoning_buf, tool_calls=tool_calls,
+                )
 
                 if not tool_calls:
                     break
@@ -462,16 +581,28 @@ def api_chat():
                 for tc in tool_calls:
                     fn_name = tc["function"]["name"]
                     yield sse("tool_call", {"name": fn_name, "args": tc["function"]["arguments"]})
-                    try:
-                        result = MCP.call_by(
-                            tool_index[fn_name][0],
-                            tool_index[fn_name][1],
-                            json.loads(tc["function"]["arguments"] or "{}"),
+                    args_j = json.loads(tc["function"]["arguments"] or "{}")
+                    if fn_name == "vcc_recall":
+                        result = format_recall(
+                            V.recall_search(
+                                sess.log,
+                                args_j.get("query", ""),
+                                mode=args_j.get("mode"),
+                                page=int(args_j.get("page", 1)),
+                            )
                         )
-                    except Exception as e:
-                        result = f"[tool error] {e}"
+                    else:
+                        try:
+                            result = MCP.call_by(
+                                tool_index[fn_name][0],
+                                tool_index[fn_name][1],
+                                args_j,
+                            )
+                        except Exception as e:
+                            result = f"[tool error] {e}"
                     preview = (result or "")[:500]
                     yield sse("tool_result", {"name": fn_name, "preview": preview})
+                    log_entry(sess, "tool", (result or "")[:12000])
                     sess.history.append(
                         {
                             "role": "tool",

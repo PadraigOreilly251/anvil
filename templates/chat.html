@@ -118,6 +118,10 @@ textarea {
     <option value="medium">think: medium</option>
     <option value="high">think: high</option>
   </select>
+  <select id="compact-mode" title="Compaction: summary = LLM summary (lossy) · vcc = algorithmic + searchable recall">
+    <option value="summary" selected>compact: summary</option>
+    <option value="vcc">compact: vcc</option>
+  </select>
   <span id="modality-badge" class="badge">text</span>
   <span class="spacer"></span>
   <span id="mcp-chips"></span>
@@ -126,7 +130,8 @@ textarea {
     <div class="ctx-bar"><div class="ctx-fill" id="ctx-fill"></div></div>
     <span id="ctx-label">0%</span>
   </div>
-  <button id="btn-compact" title="Compact conversation history now">🗜 Compact</button>
+  <button id="btn-compact" title="Compact conversation history now (mode above)">🗜 Compact</button>
+  <button id="btn-recall" title="Search the full session transcript (survives compaction)">🔍 Recall</button>
   <button id="btn-reset" class="danger" title="Clear conversation">↺ Reset</button>
 </header>
 
@@ -306,6 +311,7 @@ async function send() {
       media: mediaIds,
       tools: toolsOn,
       thinking: $("think-select").value,
+      compact_mode: $("compact-mode").value,
     }),
   });
 
@@ -398,12 +404,36 @@ $("btn-compact").onclick = async () => {
   try {
     const r = await fetch("/api/compact", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: currentModel.id }),
+      body: JSON.stringify({ model: currentModel.id, mode: $("compact-mode").value }),
     });
     const j = await r.json();
     toast(j.ok ? `compacted (round ${j.compactions}, ~${j.est} tok)` : "nothing to compact yet", j.ok ? "ok" : "err");
     if (j.ok) setCtx(j.est, currentModel.context_window);
   } catch (e) { toast("compact failed: " + e, "err"); }
+};
+
+$("btn-recall").onclick = async () => {
+  const q = prompt("Search transcript (keyword or regex; 'touched' for paths): ");
+  if (!q) return;
+  try {
+    const r = await fetch("/api/recall", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: q, mode: q.trim() === "touched" ? "touched" : null }),
+    });
+    const j = await r.json();
+    let lines = [];
+    for (const t of j.touched || [])
+      lines.push(`${t.path}  #${t.entries.join(", #")}`);
+    for (const h of j.hits || [])
+      lines.push(`#${h.idx} [${h.role}] (score ${h.score}) ${h.snippet}`);
+    if (!lines.length) { toast("no matches", "err"); return; }
+    const d = document.createElement("details");
+    d.className = "thinking";
+    d.innerHTML = `<summary>🔍 ${esc(q)} — ${j.total} result${j.total === 1 ? "" : "s"}</summary><div class="thinkbody" style="font-style:normal">` +
+      lines.map(esc).join("\n") + `</div>`;
+    addMsg("tool", "").before(d);
+    chatEl.scrollTop = chatEl.scrollHeight;
+  } catch (e) { toast("recall failed: " + e, "err"); }
 };
 
 loadModels().then(loadMcpStatus);

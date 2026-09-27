@@ -20,10 +20,19 @@ MCP, per-message thinking-level control, and automatic context compaction.
   - stdio subprocess
   Toggle "MCP tools" in the header; per-model `tools` flag; per-server status
   dots; `/api/mcp/refresh` to reconnect.
-- **Context compaction** — token estimate per message (chars/4 + 1600/image);
-  auto-compacts at 80% of the context window and on context-limit errors
-  (summarizes older history via the model, keeps the 6 most recent turns).
-  Manual 🗜 Compact button; live context % meter.
+- **Context compaction — two selectable modes** (per-session dropdown):
+  - `summary` (default): LLM summarization — auto-compacts at 80% of the
+    context window and on context-limit errors (summarizes older history,
+    keeps the 6 most recent messages)
+  - `vcc`: algorithmic, zero LLM calls, deterministic — extracted sections
+    (session goal, files & changes, outstanding context, user preferences,
+    bounded merge on repeat compactions) + collapsed transcript with
+    `(#N)` tool refs
+  - **lossless recall in both modes**: a per-session transcript log
+    (including thinking and tool calls) survives compaction; the built-in
+    `vcc_recall` tool lets the model search it (keyword/regex, ranked,
+    `mode=touched`, `#N` expand); users use the 🔍 Recall button
+  - Manual 🗜 Compact button; live context % meter
 - **Reset** — clears session history server-side and in the UI.
 - Streaming over SSE, tool-call chips, no frontend build step
   (Flask + vanilla JS in one template).
@@ -49,17 +58,18 @@ simply ignore the extra params.
 | `/api/chat` | POST | `{model, message, media[], tools, thinking}` → SSE stream |
 | `/api/upload` | POST | multipart `file` → media record |
 | `/api/reset` | POST | clear session |
-| `/api/compact` | POST | force compaction now |
+| `/api/compact` | POST | force compaction now (body `mode: summary\|vcc`) |
+| `/api/recall` | POST | search the session transcript log (`query`, optional `mode`, `page`) |
 | `/api/mcp/refresh` | POST | reconnect MCP servers |
 
 SSE event types: `token`, `thinking`, `tool_call`, `tool_result`,
 `compacted`, `status`, `done` (carries token estimate + thinking size),
 `error`.
-
 ## Layout
 ```
 app.py               # Flask server: sessions, chat loop, compaction, media
 mcp_client.py        # self-contained MCP client (streamable-HTTP + stdio)
+vcc_compact.py       # algorithmic compaction (vcc) + recall search — pure stdlib
 config.json          # models, MCP servers, compaction knobs
 templates/chat.html  # the entire frontend (vanilla JS)
 run-anvil.sh         # launcher (venv + deps + port)
@@ -67,7 +77,8 @@ run-anvil.sh         # launcher (venv + deps + port)
 
 ## Notes
 - Sessions are in-memory (per model id, locked); the reset button is the
-  lifecycle. Uploaded media live in `media/` until process restart.
+  lifecycle (it also clears the vcc transcript log). Uploaded media live in
+  `media/` until process restart.
 - Assistant turns store `reasoning_content` so multi-turn replay matches what
   vLLM expects for thinking models.
 - Dev server is fine for single-user LAN use; put gunicorn behind it for
