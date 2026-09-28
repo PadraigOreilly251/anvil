@@ -32,7 +32,7 @@ os.makedirs(MEDIA_DIR, exist_ok=True)
 app = Flask(__name__)
 app.config["TEMPLATES_AUTO_RELOAD"] = True
 
-MAX_TOOL_ROUNDS = 6
+MAX_TOOL_ROUNDS = 12  # fallback if config.json has no tools.max_rounds
 
 
 def load_config():
@@ -206,12 +206,21 @@ def do_compact(sess, model, image_tokens, emit, mode="summary"):
             )
             r.raise_for_status()
             summary = (r.json()["choices"][0]["message"].get("content") or "").strip()
+    nudge = (
+        "\n\nPruned earlier turns remain searchable in the full transcript: call the "
+        "vcc_recall tool (keyword query; mode='touched' for file paths; '#N' for one "
+        "entry). Use it proactively whenever exact earlier details are missing — never "
+        "tell the user the information is unavailable."
+        if sess.log
+        else ""
+    )
     sess.history = [
         {
             "role": "system",
             "content": (
                 "[HISTORY COMPACTED — earlier conversation, see summary below]\n"
                 + summary
+                + nudge
             ),
         }
     ] + sess.history[-keep:]
@@ -246,7 +255,72 @@ def api_models():
 
 @app.get("/api/status")
 def api_status():
-    return jsonify(mcp=MCP.status, config_port=CONFIG.get("port", 8590))
+    return jsonify(
+        mcp=MCP.status,
+        config_port=CONFIG.get("port", 8590),
+        tools={
+            "max_rounds": CONFIG.get("tools", {}).get("max_rounds", MAX_TOOL_ROUNDS),
+            "grace_response": bool(
+                CONFIG.get("tools", {}).get("grace_response", True)
+            ),
+        },
+    )
+
+
+@app.get("/api/history")
+def api_history():
+    """Renderable transcript of a session's CURRENT model context."""
+    sid = request.args.get("session", "main")
+    s = get_session(sid)
+    with s.lock:
+        tool_results = {}
+        for m in s.history:
+            if m.get("role") == "tool":
+                tool_results[m.get("tool_call_id")] = m.get("content") or ""
+        items = []
+        for m in s.history:
+            role = m.get("role")
+            if role == "system":
+                items.append({"role": "system", "text": (m.get("content") or "")[:2500]})
+            elif role == "user":
+                c = m.get("content")
+                text, images = "", []
+                if isinstance(c, str):
+                    text = c
+                elif isinstance(c, list):
+                    for p in c:
+                        if p.get("type") == "text":
+                            text += p.get("text", "")
+                        elif p.get("type") == "image_url":
+                            images.append(p.get("image_url", {}).get("url", ""))
+                items.append({"role": "user", "text": text, "images": images})
+            elif role == "assistant":
+                tools = []
+                for tc in m.get("tool_calls") or []:
+                    fn = tc.get("function", {})
+                    tools.append(
+                        {
+                            "name": fn.get("name", "?"),
+                            "args": (fn.get("arguments") or "")[:300],
+                            "preview": (tool_results.get(tc.get("id"), "") or "")[:300],
+                        }
+                    )
+                items.append(
+                    {
+                        "role": "assistant",
+                        "text": m.get("content") or "",
+                        "thinking": (m.get("reasoning_content") or "")[:4000],
+                        "tools": tools,
+                    }
+                )
+        return jsonify(
+            items=items,
+            compactions=s.compactions,
+            mode=s.mode,
+            est=estimate_tokens(
+                s.history, CONFIG.get("image_tokens", 1600)
+            ),
+        )
 
 
 @app.post("/api/mcp/refresh")
@@ -354,6 +428,18 @@ def api_chat():
     if think not in ("off", "low", "medium", "high"):
         think = "off"
     sid = data.get("session", "main")
+    tool_cfg = CONFIG.get("tools", {})
+    try:
+        tool_limit = int(
+            data.get("tool_limit")
+            or tool_cfg.get("max_rounds", MAX_TOOL_ROUNDS)
+        )
+    except (TypeError, ValueError):
+        tool_limit = tool_cfg.get("max_rounds", MAX_TOOL_ROUNDS)
+    tool_limit = max(1, min(tool_limit, 64))
+    grace = tool_cfg.get("grace_response", True)
+    if data.get("grace") is not None:
+        grace = bool(data.get("grace"))
 
     sess = get_session(sid)
     image_tokens = CONFIG.get("image_tokens", 1600)
@@ -412,10 +498,12 @@ def api_chat():
                         "function": {
                             "name": "vcc_recall",
                             "description": (
-                                "Search this session's full transcript, including "
-                                "anything dropped by compaction. Use when earlier "
-                                "details are missing. mode='touched' lists "
-                                "files/paths with entry indices; query '#N' "
+                                "Search this session's full transcript — everything, "
+                                "including what compaction dropped. Call this "
+                                "PROACTIVELY whenever you need exact earlier details "
+                                "(filenames, numbers, decisions, prior tool results) "
+                                "instead of assuming they are lost. mode='touched' "
+                                "lists files/paths with entry indices; query '#N' "
                                 "returns entry N in full."
                             ),
                             "parameters": {
@@ -434,6 +522,8 @@ def api_chat():
                 )
             compacted_this_turn = False
             thinking_total = 0
+            tool_rounds = 0
+            final_round = False
             max_attempts = 3
             attempt = 0
             while True:
@@ -459,7 +549,7 @@ def api_chat():
                     "stream": True,
                     "max_tokens": max_out,
                 }
-                if tools:
+                if tools and not final_round:
                     body["tools"] = tools
                     body["tool_choice"] = "auto"
                 # per-level mapping: "high" omits the param -> server default
@@ -559,6 +649,8 @@ def api_chat():
                             },
                         }
                     )
+                attempt = 0  # fresh retry budget for the next round
+
                 asst = {"role": "assistant", "content": content_buf or None}
                 if reasoning_buf:
                     asst["reasoning_content"] = reasoning_buf
@@ -571,10 +663,7 @@ def api_chat():
                     reasoning=reasoning_buf, tool_calls=tool_calls,
                 )
 
-                if not tool_calls:
-                    break
-                if attempt > MAX_TOOL_ROUNDS:
-                    yield sse("error", {"error": "tool loop limit reached"})
+                if final_round or not tool_calls:
                     break
 
                 # ---- run tools
@@ -610,6 +699,35 @@ def api_chat():
                             "content": (result or "")[:12000],
                         }
                     )
+
+                tool_rounds += 1
+                if tool_rounds >= tool_limit:
+                    if not grace:
+                        yield sse(
+                            "error",
+                            {
+                                "error": f"tool-call limit ({tool_limit}) reached — turn stopped (grace off). "
+                                "Raise the limit or enable grace for a final answer."
+                            },
+                        )
+                        break
+                    yield sse(
+                        "status",
+                        {"status": f"tool-call limit ({tool_limit}) reached — final answer without tools"},
+                    )
+                    sess.history.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "You have reached the tool-call limit for this turn. "
+                                "Do NOT request any more tools. Based on the results "
+                                "you already have, give your best answer to the user's "
+                                "question now. Note anything you could not finish."
+                            ),
+                        }
+                    )
+                    log_entry(sess, "user", "[tool-limit instruction: answer now, no more tools]")
+                    final_round = True
                 continue
 
             yield sse(

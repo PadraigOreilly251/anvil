@@ -6,6 +6,10 @@
     "auto_threshold": 0.8,
     "max_tokens": 2000
   },
+  "tools": {
+    "max_rounds": 12,
+    "grace_response": true
+  },
   "models": [
     {
       "id": "model-a",
@@ -14,7 +18,10 @@
       "model": "model-a",
       "context_window": 131072,
       "max_tokens": 131072,
-      "input": ["text", "image"],
+      "input": [
+        "text",
+        "image"
+      ],
       "tools": true
     },
     {
@@ -24,7 +31,10 @@
       "model": "model-b",
       "context_window": 110000,
       "max_tokens": 100000,
-      "input": ["text", "image"],
+      "input": [
+        "text",
+        "image"
+      ],
       "tools": true
     },
     {
@@ -34,7 +44,9 @@
       "model": "model-c",
       "context_window": 100000,
       "max_tokens": 100000,
-      "input": ["text"],
+      "input": [
+        "text"
+      ],
       "tools": false
     }
   ],
